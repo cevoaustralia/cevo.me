@@ -1,0 +1,394 @@
+{
+  "AWSTemplateFormatVersion": "2010-09-09",
+  "Description": "Serverless private URL shortener based on Amazon S3, AWS Lambda, Amazon CloudFront and API Gateway.",
+
+  "Parameters": {
+    "S3BucketName": {
+      "Type": "String",
+      "Description": "Enter the Amazon S3 bucket to use for the URL shortener, or leave empty to create a new bucket with automatically generated name. The S3 bucket is kept after you delete this template."
+    },
+    "URLExpiration": {
+      "Type": "Number",
+      "Default": "7",
+      "Description": "Expiration in days for short URLs. After this delay, short URLs will be automatically deleted."
+    }
+  },
+
+  "Conditions" : {
+    "CreateNewBucket" : { "Fn::Equals": [ "", { "Ref": "S3BucketName" }]}
+  },
+
+  "Resources": {
+    "S3BucketForURLs": {
+      "Type" : "AWS::S3::Bucket",
+      "DeletionPolicy" : "Delete",
+      "Properties" : {
+        "BucketName": { "Fn::If" : [ "CreateNewBucket",
+                                     {"Ref" : "AWS::NoValue"},
+                                     {"Ref" : "S3BucketName"} ]},
+        "WebsiteConfiguration": { "IndexDocument": "index.html" },
+        "LifecycleConfiguration": {
+          "Rules": [ {
+            "Id" : "DisposeShortUrls",
+            "ExpirationInDays" : { "Ref": "URLExpiration" },
+            "Prefix" : "u",
+            "Status" : "Enabled"
+          }]
+        }
+      }
+    },
+    "S3BucketPolicy": {
+      "Type": "AWS::S3::BucketPolicy",
+      "Properties": {
+        "Bucket": { "Ref": "S3BucketForURLs" },
+        "PolicyDocument": {
+          "Version": "2012-10-17",
+          "Statement": [
+            {
+              "Sid": "AddPerm",
+              "Effect": "Allow",
+              "Principal": "*",
+              "Action": "s3:GetObject",
+              "Resource": { "Fn::Join" : ["", ["arn:aws:s3:::", { "Ref" : "S3BucketForURLs" } , "/*" ]]}
+            }
+          ]
+        }
+      }
+    },
+    "LambdaExecRole": {
+      "Type": "AWS::IAM::Role",
+      "Properties": {
+        "Policies": [
+          {
+            "PolicyName": "LambdaExecRoleUrlShortener",
+            "PolicyDocument": {
+              "Version": "2012-10-17",
+              "Statement": [
+                {
+                  "Effect": "Allow",
+                  "Action": "logs:*",
+                  "Resource": "arn:aws:logs:*:*:*"
+                },
+                {
+                  "Effect": "Allow",
+                  "Action": [ "s3:PutObject", "s3:DeleteObject" ],
+                  "Resource": { "Fn::Join" : ["", ["arn:aws:s3:::", { "Ref" : "S3BucketForURLs" } , "/*" ]]}
+                },
+                {
+                  "Effect": "Allow",
+                  "Action": [ "s3:ListBucket" ],
+                  "Resource": { "Fn::Join" : ["", ["arn:aws:s3:::", { "Ref" : "S3BucketForURLs" } ]]}
+                },
+                {
+                  "Effect": "Allow",
+                  "Action": ["s3:GetObject", "s3:GetObjectAcl"],
+                  "Resource": "arn:aws:s3:::*"
+                }
+              ]
+            }
+          }],
+        "AssumeRolePolicyDocument": {
+          "Version": "2012-10-17",
+          "Statement": [
+            {
+              "Sid": "",
+              "Effect": "Allow",
+              "Principal": {
+                "Service": "lambda.amazonaws.com"
+              },
+              "Action": "sts:AssumeRole"
+            }
+          ]
+        }
+      }
+    },
+    "CloudFrontDistrib": {
+      "Type" : "AWS::CloudFront::Distribution",
+      "Properties": {
+        "DistributionConfig": {
+          "Origins": [
+                {
+                    "DomainName": { "Fn::GetAtt": [ "S3BucketForURLsDomain", "Domain" ] },
+                    "Id": "OriginRedirect",
+                    "CustomOriginConfig": { "OriginProtocolPolicy": "http-only" },
+                    "OriginPath": "/u"
+                },
+                {
+                    "DomainName": { "Fn::GetAtt": [ "S3BucketForURLsDomain", "Domain" ] },
+                    "Id": "OriginAdmin",
+                    "CustomOriginConfig": { "OriginProtocolPolicy": "http-only" }
+                },
+                {
+                    "DomainName": { "Fn::Join" : [ "", [ { "Ref": "URLShortenerAPI" }, ".execute-api.", { "Ref" : "AWS::Region" }, ".amazonaws.com" ] ] },
+                    "Id": "OriginAPIGW",
+                    "CustomOriginConfig": { "OriginProtocolPolicy": "match-viewer" }
+                }
+            ],
+          "Comment": "CloudFront distribution used as a front end to the server-less URL Shortener",
+          "DefaultCacheBehavior": {
+            "ForwardedValues": { "QueryString": false },
+            "TargetOriginId": "OriginRedirect",
+            "ViewerProtocolPolicy": "redirect-to-https"
+          },
+          "CacheBehaviors": [
+            {
+              "ForwardedValues": { "QueryString": false },
+              "TargetOriginId": "OriginAdmin",
+              "ViewerProtocolPolicy": "redirect-to-https",
+              "PathPattern": "/admin/*"
+            },
+            {
+              "AllowedMethods": ["DELETE", "GET", "HEAD", "OPTIONS", "PATCH", "POST", "PUT"],
+              "CachedMethods": ["GET", "HEAD", "OPTIONS"],
+              "ForwardedValues": {
+                "Headers": ["Origin", "Referer"],
+                "QueryString": false
+              },
+              "ForwardedValues": { "QueryString": false },
+              "TargetOriginId": "OriginAPIGW",
+              "ViewerProtocolPolicy": "https-only",
+              "PathPattern": "/prod/*"
+            }
+          ],
+          "Enabled": true
+        }
+      }
+    },
+    "LambdaShortener": {
+      "Type" : "AWS::Lambda::Function",
+      "Properties": {
+        "Code": {
+          "ZipFile": {
+            "Fn::Join": [
+              "\n",
+              [
+                "// Lambda URL shortener function, called via API Gateway",
+                "// Creates an Amazon S3 object with random name and adds metadata for http redirect",
+                "var AWS = require('aws-sdk');",
+                "var url = require('url');",
+                "",
+                "// configuration to be customized",
+                { "Fn::Join" : ["", ["var S3_Bucket = \"", { "Ref" : "S3BucketForURLs" } , "\";" ]]},
+                { "Fn::Join" : ["", ["var S3_Region = \"", { "Ref" : "AWS::Region" } , "\";" ]]},
+                "var S3_Prefix = \"u\";",
+                "",
+                "// generate a 7 char shortid",
+                "var shortid = function() {",
+                "  return 'xxxxxxx'.replace(/x/g, function(c) {",
+                "    return (Math.random()*36|0).toString(36);",
+                "  });",
+                "}",
+                "",
+                "exports.handler = function(event, context) {",
+                "  var s3 = new AWS.S3({ region: S3_Region });",
+                "  var url_long = event.url_long;",
+                "  var cdn_prefix = event.cdn_prefix;",
+                "  var retry = 0;    // try at most 3 times to create unique id",
+                "",
+                "  var done = function (url_short, error) {",
+                "    context.succeed({ url_long: url_long, url_short: url_short, error: error });",
+                "  };",
+                "",
+                "  var check_and_create_s3_redirect = function(s3_bucket, key_short, url_long) {",
+                "    s3.headObject({ Bucket: s3_bucket, Key: key_short }, function(err, data) {",
+                "      if (err) {",
+                "        // we should normall have a NotFound error showing that the id is not already in use",
+                "        if (err.code === \"NotFound\") {",
+                "          // normal execution path",
+                "          s3.putObject({ Bucket: s3_bucket, Key: key_short, Body: \"\", WebsiteRedirectLocation: url_long, ContentType: \"text/plain\" }, ",
+                "            function(err, data) {",
+                "              if (err) { done(\"\", err.message); }",
+                "              else {",
+                "                var ret_url = \"https://\" + cdn_prefix + \"/\" + id_short;",
+                "                console.log(\"Success, short_url = \"+ret_url);",
+                "                done(ret_url, \"\");",
+                "              }",
+                "            });",
+                "        } else {",
+                "          // treat all other errors as fatal",
+                "          done(\"\", \"Could not find an suitable name, error: \" + err.code);",
+                "        }",
+                "      } else {",
+                "        // we found a duplicate, let's retry a limited number of times",
+                "        retry += 1;",
+                "        if (retry <= 3) {",
+                "          check_and_create_s3_redirect(s3_bucket, key_short, url_long);",
+                "        } else {",
+                "          // abort after 3 tries",
+                "          done(\"\", \"Cannot find an unused short id, aborting.\" );",
+                "        }",
+                "      }",
+                "    });",
+                "  }",
+                "",
+                "  // check if url is valid",
+                "  var url_check = url.parse(url_long);",
+                "  if (!((url_check) && (url_check.host))) { return done(\"\", \"Invalid URL format\"); }",
+                "",
+                "  console.log(\"Long URL to shorten: \" + url_long);",
+                "  var id_short = shortid();",
+                "  var key_short = S3_Prefix + \"/\" + id_short;",
+                "  console.log(\"Short id = \" + key_short);",
+                "  check_and_create_s3_redirect(S3_Bucket, key_short, url_long);",
+                "};"
+              ]
+            ]
+          }
+        },
+        "Handler": "index.handler",
+        "MemorySize": 384,
+        "Role": {"Fn::GetAtt" : ["LambdaExecRole", "Arn"] },
+        "Runtime": "nodejs",
+        "Timeout": 10
+      }
+    },
+    "LambdaShortenerInvokePermission": {
+      "Type": "AWS::Lambda::Permission",
+      "Properties": {
+        "FunctionName" : { "Fn::GetAtt" : ["LambdaShortener", "Arn"] },
+        "Action": "lambda:InvokeFunction",
+        "Principal": "apigateway.amazonaws.com",
+        "SourceArn": { "Fn::Join" : ["", [ "arn:aws:execute-api:", { "Ref" : "AWS::Region" }, ":", { "Ref": "AWS::AccountId" },
+                                           ":", { "Ref": "URLShortenerAPI" }, "/*/POST/" ]]}
+      }
+    },
+    "LambdaS3Copy": {
+      "Type" : "AWS::Lambda::Function",
+      "Properties": {
+        "Code": {
+          "ZipFile": {
+            "Fn::Join": [
+              "\n",
+              [ "// Lambda helper function, CloudFormation custom resource",
+                "// Copy an object from an Amazon S3 bucket to another bucket",
+                "var AWS = require('aws-sdk');",
+                "var response = require('cfn-response');",
+                "",
+                "exports.handler = function(event, context) {",
+                "  var s3 = new AWS.S3();",
+                "  var src = event.ResourceProperties.Source;",
+                "  var bucket = event.ResourceProperties.Bucket;",
+                "  var key = event.ResourceProperties.Key;",
+                "  if (event.RequestType == 'Delete') {",
+                "    s3.deleteObject({Bucket: bucket, Key: key}, function(err, data) {",
+                "      if (err) { response.send(event, context, response.FAILED, err); }",
+                "      else { response.send(event, context, response.SUCCESS); }",
+                "    })",
+                "  } else {",
+                "    s3.copyObject({CopySource: src, Bucket: bucket, Key: key}, function(err, data) {",
+                "      if (err) { response.send(event, context, response.FAILED, err); }",
+                "      else { response.send(event, context, response.SUCCESS); }",
+                "    });",
+                "  }",
+                "};",
+                ""
+              ]
+            ]
+          }
+        },
+        "Handler": "index.handler",
+        "MemorySize": 128,
+        "Role": {"Fn::GetAtt" : ["LambdaExecRole", "Arn"] },
+        "Runtime": "nodejs",
+        "Timeout": 10
+      }
+    },
+    "CopyAdminPage": {
+      "Type" : "Custom::LambdaS3Copy",
+      "Version" : "1.0",
+      "Properties": {
+        "ServiceToken": { "Fn::GetAtt" : ["LambdaS3Copy", "Arn"] },
+        "Bucket": { "Ref" : "S3BucketForURLs" },
+        "Key": "admin/index.html",
+        "Source": "sha-public-us-west-2/URLShortener/index.html"
+      }
+    },
+    "LambdaURLtoDomain": {
+      "Type" : "AWS::Lambda::Function",
+      "Properties": {
+        "Code": {
+          "ZipFile": {
+            "Fn::Join": [
+              "\n",
+              [ "// Lambda helper function, CloudFormation custom resource",
+                "// Extract hostname from an URL",
+                "var url = require('url');",
+                "var response = require('cfn-response');",
+                "",
+                "exports.handler = function(event, context) {",
+                "  var url_check = url.parse(event.ResourceProperties.APIUrl);",
+                "  var APIUrl = url_check.hostname || url_check.href;",
+                "  var responseData = { Domain: APIUrl };",
+                "  response.send(event, context, response.SUCCESS, responseData);",
+                "};",
+                ""
+              ]
+            ]
+          }
+        },
+        "Handler": "index.handler",
+        "MemorySize": 128,
+        "Role": {"Fn::GetAtt" : ["LambdaExecRole", "Arn"] },
+        "Runtime": "nodejs",
+        "Timeout": 10
+      }
+    },
+    "S3BucketForURLsDomain": {
+      "Type" : "Custom::LambdaURLtoDomain",
+      "Version" : "1.0",
+      "Properties": {
+        "ServiceToken": { "Fn::GetAtt" : ["LambdaURLtoDomain", "Arn"] },
+        "APIUrl": { "Fn::GetAtt" : [ "S3BucketForURLs", "WebsiteURL" ] }
+      }
+    },
+    "URLShortenerAPI": {
+      "Type": "AWS::ApiGateway::RestApi",
+      "Properties": {
+        "Description": "Rest API for URL Shortener",
+        "Name": { "Ref" : "LambdaShortener" }
+      }
+    },
+    "URLShortenerAPIMethod": {
+      "Type": "AWS::ApiGateway::Method",
+      "Properties": {
+        "RestApiId": { "Ref": "URLShortenerAPI" },
+        "ResourceId": { "Fn::GetAtt": ["URLShortenerAPI", "RootResourceId"] },
+        "HttpMethod": "POST",
+        "AuthorizationType": "NONE",
+        "Integration": {
+          "Type": "AWS",
+          "IntegrationHttpMethod": "POST",
+          "Uri": { "Fn::Join" : ["", [ "arn:aws:apigateway:", { "Ref" : "AWS::Region" }, ":lambda:path/2015-03-31/functions/",
+                                       { "Fn::GetAtt" : [ "LambdaShortener", "Arn" ] }, "/invocations" ]]},
+          "IntegrationResponses": [{
+            "StatusCode": "200",
+            "ResponseTemplates": { }
+          }]
+        },
+        "MethodResponses": [{
+          "ResponseModels": { },
+          "StatusCode": "200"
+        }]
+      }
+    },
+    "URLShortenerAPIDeployment": {
+      "Type": "AWS::ApiGateway::Deployment",
+      "DependsOn": "URLShortenerAPIMethod",
+      "Properties": {
+        "RestApiId": { "Ref": "URLShortenerAPI" },
+        "StageName": "prod"
+      }
+    }
+  },
+
+  "Outputs": {
+    "S3BucketName": {
+      "Description": "Amazon S3 bucket name holding short URLs redirect objects. Note: the bucket will not be deleted when you delete this template.",
+      "Value": { "Ref": "S3BucketForURLs" }
+    },
+    "ConnectURL": {
+      "Description": "URL to connect to the admin page of the URL Shortener. Do not use until you update the template with the API Gateway endpoint you need to manually create.",
+      "Value": { "Fn::Join" : [ "", [ "https://", {"Fn::GetAtt" : ["CloudFrontDistrib", "DomainName"] }, "/admin/" ]]}
+    }
+  }
+}
