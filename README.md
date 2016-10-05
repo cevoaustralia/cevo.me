@@ -1,5 +1,9 @@
 # cevo.me
 
+## Origins
+
+Based on the template from https://aws.amazon.com/blogs/compute/build-a-serverless-private-url-shortener/
+
 ## Create
 
 1. Stand up the cloudformation stack
