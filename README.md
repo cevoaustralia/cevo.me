@@ -18,3 +18,6 @@ Based on the template from https://aws.amazon.com/blogs/compute/build-a-serverle
 
 Not much. Obscurity to protect the index.html, so call it something odd.
 
+## Logs
+
+Logs go into the S3 bucket cevo.me-logs from both the S3 redirector and from CloudFront 
